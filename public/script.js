@@ -151,6 +151,145 @@ const IDB = {
 }
 
 /* ═══════════════════════════════════════════════
+/* ═══════════════════════════════════════════════
+   OFFLINE CACHE — Cache song metadata & thumbnails for offline use
+   ═══════════════════════════════════════════════ */
+const OfflineCache = {
+  _db: null,
+  STORE: 'offline_songs',
+  THUMB_STORE: 'offline_thumbs',
+
+  async open(){
+    if(this._db) return this._db
+    return new Promise((res,rej)=>{
+      const req = indexedDB.open('hoktify_offline_v1', 1)
+      req.onupgradeneeded = e => {
+        const db = e.target.result
+        if(!db.objectStoreNames.contains(this.STORE))
+          db.createObjectStore(this.STORE, {keyPath:'id'})
+        if(!db.objectStoreNames.contains(this.THUMB_STORE))
+          db.createObjectStore(this.THUMB_STORE, {keyPath:'id'})
+      }
+      req.onsuccess = e => { this._db = e.target.result; res(this._db) }
+      req.onerror = () => rej(req.error)
+    })
+  },
+
+  async cacheSong(song){
+    try {
+      const db = await this.open()
+      await new Promise((res,rej)=>{
+        const tx = db.transaction(this.STORE,'readwrite')
+        tx.objectStore(this.STORE).put({...song, cachedAt: Date.now()})
+        tx.oncomplete = ()=>res(true)
+        tx.onerror = ()=>rej(tx.error)
+      })
+      if(song.thumbnail){
+        try {
+          const resp = await fetch(song.thumbnail, {mode:'cors'})
+          if(resp.ok){
+            const blob = await resp.blob()
+            const reader = new FileReader()
+            const dataUrl = await new Promise(r=>{ reader.onload=()=>r(reader.result); reader.readAsDataURL(blob) })
+            await new Promise((res2)=>{
+              const tx2 = db.transaction(this.THUMB_STORE,'readwrite')
+              tx2.objectStore(this.THUMB_STORE).put({id:song.id, dataUrl, cachedAt:Date.now()})
+              tx2.oncomplete=()=>res2(true)
+              tx2.onerror=()=>res2(false)
+            })
+          }
+        } catch { /* thumbnail cache fail is ok */ }
+      }
+      return true
+    } catch(e){ console.warn('[OfflineCache] cache error',e); return false }
+  },
+
+  async getCachedSong(id){
+    try {
+      const db = await this.open()
+      return new Promise((res)=>{
+        const tx = db.transaction(this.STORE,'readonly')
+        const req = tx.objectStore(this.STORE).get(id)
+        req.onsuccess = () => res(req.result||null)
+        req.onerror = () => res(null)
+      })
+    } catch{ return null }
+  },
+
+  async getCachedThumb(id){
+    try {
+      const db = await this.open()
+      return new Promise((res)=>{
+        const tx = db.transaction(this.THUMB_STORE,'readonly')
+        const req = tx.objectStore(this.THUMB_STORE).get(id)
+        req.onsuccess = () => res(req.result?.dataUrl||null)
+        req.onerror = () => res(null)
+      })
+    } catch{ return null }
+  },
+
+  async getAllCached(){
+    try {
+      const db = await this.open()
+      return new Promise((res)=>{
+        const tx = db.transaction(this.STORE,'readonly')
+        const req = tx.objectStore(this.STORE).getAll()
+        req.onsuccess = () => res(req.result||[])
+        req.onerror = () => res([])
+      })
+    } catch{ return [] }
+  },
+
+  async isCached(id){
+    const s = await this.getCachedSong(id)
+    return !!s
+  },
+
+  async removeCached(id){
+    try {
+      const db = await this.open()
+      await new Promise(res=>{
+        const tx=db.transaction(this.STORE,'readwrite')
+        tx.objectStore(this.STORE).delete(id)
+        tx.oncomplete=()=>res()
+      })
+      await new Promise(res=>{
+        const tx=db.transaction(this.THUMB_STORE,'readwrite')
+        tx.objectStore(this.THUMB_STORE).delete(id)
+        tx.oncomplete=()=>res()
+      })
+      return true
+    } catch{ return false }
+  },
+
+  async cachePlaylist(pl, onProgress){
+    const songs = pl.songs || []
+    let done = 0
+    for(const song of songs){
+      const already = await this.isCached(song.id)
+      if(!already){ await this.cacheSong(song) }
+      done++
+      onProgress?.(done, songs.length)
+    }
+    return done
+  },
+
+  async isPlaylistCached(pl){
+    const songs = pl.songs || []
+    if(!songs.length) return false
+    for(const s of songs){ if(!(await this.isCached(s.id))) return false }
+    return true
+  },
+
+  async getCachedCount(pl){
+    const songs = pl.songs || []
+    let count = 0
+    for(const s of songs){ if(await this.isCached(s.id)) count++ }
+    return count
+  }
+}
+
+/* ═══════════════════════════════════════════════
    PLAYLIST STORE — unified access layer
    ═══════════════════════════════════════════════ */
 const PlStore = {
@@ -367,8 +506,8 @@ const PlayerCtrl = {
       YTPlayer.seek(parseFloat(seek.value))
     })
     $('fp-detail-open').addEventListener('click',()=>{ if(this.current) DetailSheet.open(this.current) })
-    $('fpc-artist-btn')?.addEventListener('click',()=>{ FP.hide(); if(this.current) DetailSheet.open(this.current) })
-    $('fpc-lyrics-btn')?.addEventListener('click',()=>{ FP.hide(); if(this.current) DetailSheet.open(this.current) })
+    $('fpc-artist-btn')?.addEventListener('click',()=>{ FP.hide(); if(this.current) DetailSheet.open(this.current,'artist') })
+    $('fpc-lyrics-btn')?.addEventListener('click',()=>{ FP.hide(); if(this.current) DetailSheet.open(this.current,'lyrics') })
   },
 
   _bindFP(){
@@ -389,6 +528,8 @@ const PlayerCtrl = {
     YTPlayer.loadVideo(song.id)
     setMediaSession(song)
     ric(()=>this._saveHist(song))
+    // Auto-cache song metadata for offline access
+    ric(()=>OfflineCache.cacheSong(song).catch(()=>{}))
   },
 
   toggle(){
@@ -747,8 +888,9 @@ function skSongs(n){
    ═══════════════════════════════════════════════ */
 const PlaylistDetail = {
   _current: null,
+  _caching: false,
 
-  open(pl){
+  async open(pl){
     this._current = pl
     $('pld-name').textContent = pl.name || 'Playlist'
 
@@ -792,6 +934,8 @@ const PlaylistDetail = {
       if(!pl.songs?.length){ Toast.show('Playlist kosong','warning'); return }
       PlayerCtrl.play(pl.songs[0], pl.songs)
       Toast.show(`Memutar ${pl.name}`,'success',1600)
+      // Auto-cache all songs in background when user plays playlist
+      ric(()=> this._bgCache(pl))
     }
 
     // Shuffle button
@@ -800,14 +944,88 @@ const PlaylistDetail = {
       const shuffled = [...pl.songs].sort(()=>Math.random()-.5)
       PlayerCtrl.play(shuffled[0], shuffled)
       Toast.show('Memutar acak','success',1600)
+      ric(()=> this._bgCache(pl))
     }
+
+    // Offline download button - update state
+    this._updateOfflineBtn(pl)
+  },
+
+  async _updateOfflineBtn(pl){
+    // Find or create offline button
+    let btn = $('pld-offline-btn')
+    if(!btn){
+      const actionsEl = document.querySelector('.pld-actions')
+      if(!actionsEl) return
+      btn = document.createElement('button')
+      btn.id = 'pld-offline-btn'
+      btn.className = 'pld-offline-btn'
+      btn.title = 'Simpan untuk offline'
+      actionsEl.appendChild(btn)
+    }
+
+    if(!pl.songs?.length){ btn.style.display='none'; return }
+    btn.style.display=''
+
+    const cachedCount = await OfflineCache.getCachedCount(pl)
+    const total = pl.songs.length
+    const allCached = cachedCount >= total
+
+    btn.innerHTML = allCached
+      ? `<svg viewBox="0 0 24 24" fill="currentColor" style="width:16px;height:16px"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41L9 16.17z"/></svg>`
+      : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:16px;height:16px"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>`
+    btn.classList.toggle('cached', allCached)
+    btn.title = allCached
+      ? `Tersimpan offline (${cachedCount}/${total})`
+      : `Simpan offline (${cachedCount}/${total} tersimpan)`
+
+    btn.onclick = async ()=> {
+      if(allCached){
+        Toast.show(`Playlist sudah tersimpan offline (${total} lagu)`,'info')
+        return
+      }
+      if(this._caching){ Toast.show('Sedang menyimpan...','info'); return }
+      this._startCache(pl, btn)
+    }
+  },
+
+  async _startCache(pl, btn){
+    this._caching = true
+    const total = pl.songs.length
+    btn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:16px;height:16px;animation:spin 1s linear infinite"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>`
+    btn.title = 'Menyimpan...'
+    Toast.show(`Menyimpan ${total} lagu untuk offline...`,'info',4000)
+
+    try {
+      await OfflineCache.cachePlaylist(pl, (done, total)=>{
+        btn.title = `Menyimpan ${done}/${total}...`
+      })
+      this._caching = false
+      Toast.show(`✓ ${total} lagu tersimpan offline!`,'success')
+      this._updateOfflineBtn(pl)
+    } catch(e){
+      this._caching = false
+      Toast.show('Gagal menyimpan offline','error')
+      this._updateOfflineBtn(pl)
+    }
+  },
+
+  async _bgCache(pl){
+    if(this._caching || !pl.songs?.length) return
+    // Silently cache in background
+    for(const song of pl.songs){
+      const cached = await OfflineCache.isCached(song.id)
+      if(!cached) await OfflineCache.cacheSong(song)
+    }
+    this._updateOfflineBtn(pl)
   },
 
   refresh(){
     if(this._current){
-      const pls = Store.get('playlists',[])
-      const updated = pls.find(p=>p.id===this._current.id)
-      if(updated) this.open(updated)
+      PlStore.getAll().then(pls=>{
+        const updated = pls.find(p=>p.id===this._current.id)
+        if(updated) this.open(updated)
+      })
     }
   }
 }
@@ -817,7 +1035,7 @@ const PlaylistDetail = {
    ═══════════════════════════════════════════════ */
 const DetailSheet = {
   _song:null,
-  open(song){
+  open(song, defaultTab='lyrics'){
     this._song=song
     $('detail-title').textContent=song.title||''
     $('detail-artist').textContent=song.artist||''
@@ -827,7 +1045,7 @@ const DetailSheet = {
     $('detail-play').onclick=()=>{ PlayerCtrl.play(song); FP.show() }
     $('detail-like').onclick=()=>{ PlayerCtrl.likeById(song); this._syncLike() }
     $('detail-add').onclick=()=>Modal.playlist(song)
-    this._switchTab('lyrics')
+    this._switchTab(defaultTab)
     if(PlayerCtrl.current?.id===song.id){
       if(LyricsCtrl._lines.length) LyricsCtrl._renderSynced($('lyrics-container'))
       else if(LyricsCtrl._plain) LyricsCtrl._renderPlain($('lyrics-container'))
@@ -835,6 +1053,7 @@ const DetailSheet = {
       LyricsCtrl.load(song)
     }
     this._loadRelated(song.id)
+    this._loadArtistInfo(song.artist||'')
     const sheet=$('detail-sheet'),bd=$('detail-backdrop')
     sheet.classList.remove('hidden'); sheet.classList.add('show')
     bd.classList.remove('hidden')
@@ -867,6 +1086,93 @@ const DetailSheet = {
     } catch(e){
       if(e.name==='AbortError') return
       rl.innerHTML=`<div style="padding:20px 0;text-align:center;color:var(--t3);font-size:.83rem">Gagal memuat</div>`
+    }
+  },
+  async _loadArtistInfo(artistName){
+    const con=$('artist-info-container')
+    if(!artistName){con.innerHTML=`<div class="artist-info-empty"><p>Info artis tidak tersedia</p></div>`;return}
+    con.innerHTML=`<div style="padding:24px 0;text-align:center"><div class="spin-ring" style="margin:0 auto"></div></div>`
+    try {
+      // Use Wikipedia search API (CORS-friendly)
+      const wikiSearch = await fetch(
+        `https://id.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(artistName+' penyanyi musisi')}&format=json&origin=*&srlimit=1`,
+        {signal:AbortSignal.timeout(8000)}
+      )
+      let wikiData = null
+      if(wikiSearch.ok){
+        const wjson = await wikiSearch.json()
+        const page = wjson?.query?.search?.[0]
+        if(page){
+          // Fetch extract
+          const wikiExtract = await fetch(
+            `https://id.wikipedia.org/w/api.php?action=query&pageids=${page.pageid}&prop=extracts|pageimages&exintro=true&exchars=600&pithumbsize=300&format=json&origin=*`,
+            {signal:AbortSignal.timeout(8000)}
+          )
+          if(wikiExtract.ok){
+            const wej = await wikiExtract.json()
+            const pg = Object.values(wej?.query?.pages||{})[0]
+            wikiData = { title: pg?.title, extract: pg?.extract, thumb: pg?.thumbnail?.source }
+          }
+        }
+      }
+      // Fallback: English Wikipedia
+      if(!wikiData){
+        const enSearch = await fetch(
+          `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(artistName+' singer musician')}&format=json&origin=*&srlimit=1`,
+          {signal:AbortSignal.timeout(8000)}
+        )
+        if(enSearch.ok){
+          const ej = await enSearch.json()
+          const page = ej?.query?.search?.[0]
+          if(page){
+            const enExtract = await fetch(
+              `https://en.wikipedia.org/w/api.php?action=query&pageids=${page.pageid}&prop=extracts|pageimages&exintro=true&exchars=600&pithumbsize=300&format=json&origin=*`,
+              {signal:AbortSignal.timeout(8000)}
+            )
+            if(enExtract.ok){
+              const wej = await enExtract.json()
+              const pg = Object.values(wej?.query?.pages||{})[0]
+              wikiData = { title: pg?.title, extract: pg?.extract, thumb: pg?.thumbnail?.source }
+            }
+          }
+        }
+      }
+      // Also search for their songs
+      const songRes = await fetch(`/api/search?q=${encodeURIComponent(artistName)}&limit=6`,{signal:AbortSignal.timeout(6000)}).catch(()=>null)
+      const songs = songRes?.ok ? (await songRes.json()).results||[] : []
+
+      this._renderArtistInfo(artistName, wikiData, songs)
+    } catch(e){
+      if(e.name==='AbortError') return
+      con.innerHTML=`<div class="artist-info-empty"><p>Gagal memuat info artis</p></div>`
+    }
+  },
+  _renderArtistInfo(name, wiki, songs){
+    const con=$('artist-info-container')
+    // Strip HTML tags from extract
+    const cleanExtract = wiki?.extract
+      ? wiki.extract.replace(/<[^>]+>/g,'').replace(/\n+/g,' ').trim().slice(0,500)
+      : null
+    con.innerHTML=`
+      <div class="artist-profile">
+        ${wiki?.thumb ? `<div class="artist-img-wrap"><img src="${wiki.thumb}" alt="${esc(name)}" class="artist-img" onerror="this.closest('.artist-img-wrap').style.display='none'"/></div>` : ''}
+        <div class="artist-name-big">${esc(wiki?.title||name)}</div>
+        <div class="artist-search-btn-row">
+          <button class="artist-search-btn" onclick="SearchCtrl.doSearch(${JSON.stringify(name)});DetailSheet.close()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+            Semua lagu ${esc(name)}
+          </button>
+        </div>
+        ${cleanExtract ? `<div class="artist-bio">${esc(cleanExtract)}</div>` : '<div class="artist-bio artist-bio-empty">Biografi tidak tersedia untuk artis ini.</div>'}
+        ${wiki ? `<a class="artist-wiki-link" href="https://${wiki.extract?.includes('ika') ? 'id' : 'en'}.wikipedia.org/wiki/${encodeURIComponent(wiki.title||name)}" target="_blank" rel="noopener">Baca selengkapnya di Wikipedia ↗</a>` : ''}
+        ${songs.length ? `
+        <div class="artist-songs-section">
+          <p class="artist-songs-title">Lagu populer</p>
+          <div class="artist-songs-list" id="artist-songs-list"></div>
+        </div>` : ''}
+      </div>`
+    if(songs.length){
+      buildSongList(songs.slice(0,6), $('artist-songs-list'))
     }
   },
   init(){
@@ -1001,6 +1307,14 @@ const SearchCtrl = {
   _all:[], _rendered:0, _BATCH:12,
   _cache:new Map(), _io:null, _activeFilter:'all',
 
+  doSearch(q){
+    // Public method to trigger search and navigate to search page
+    Router.go('search')
+    const inp=$('search-input')
+    if(inp){ inp.value=q; inp.dispatchEvent(new Event('input')) }
+    const isLyric=SmartQuery.isLyric(q); this.search(q,isLyric)
+  },
+
   init(){
     const inp=$('search-input'), clr=$('search-clear')
     const doSearch=debounce(q=>{ const isLyric=SmartQuery.isLyric(q); this.search(q,isLyric) }, 380)
@@ -1118,6 +1432,7 @@ const LibCtrl = {
       })
     })
     $('lsp-liked')?.addEventListener('click',()=>{ this._openTab('songs'); this._renderSongs() })
+    $('lsp-offline')?.addEventListener('click',()=>{ this._openOfflineSongs() })
     $('lsp-history')?.addEventListener('click',()=>{
       const h=Store.get('history',[]); if(!h.length){Toast.show('Belum ada riwayat','info');return}
       PlayerCtrl.play(h[0],h); Toast.show(`${h.length} lagu dari riwayat`,'success')
@@ -1138,9 +1453,33 @@ const LibCtrl = {
     this.render()
   },
   render(){ this.updateCounts(); this.renderPlaylists(); this._renderSongs() },
-  updateCounts(){
+  async updateCounts(){
     const lc=$('liked-cnt'); if(lc) lc.textContent=Store.get('liked',[]).length+' lagu'
     const hc=$('hist-cnt');  if(hc) hc.textContent=Store.get('history',[]).length+' lagu'
+    const oc=$('offline-cnt'); if(oc){
+      OfflineCache.getAllCached().then(songs=>{ if(oc) oc.textContent=songs.length+' lagu' })
+    }
+  },
+  async _openOfflineSongs(){
+    const songs = await OfflineCache.getAllCached()
+    if(!songs.length){ Toast.show('Belum ada lagu tersimpan offline','info'); return }
+    // Enrich thumbs from cache
+    const enriched = await Promise.all(songs.map(async s=>{
+      const cachedThumb = await OfflineCache.getCachedThumb(s.id)
+      return {...s, thumbnail: cachedThumb || s.thumbnail}
+    }))
+    this._openTab('songs')
+    const el=$('lib-songs'), em=$('lib-songs-empty')
+    em?.classList.add('hidden')
+    el.innerHTML=''
+    // Show header
+    const hdr=document.createElement('div')
+    hdr.style.cssText='padding:8px 0 12px;display:flex;align-items:center;justify-content:space-between'
+    hdr.innerHTML=`<span style="font-size:.78rem;font-weight:700;color:var(--t3);letter-spacing:.04em;text-transform:uppercase">Tersimpan Offline · ${enriched.length} lagu</span>
+      <button onclick="LibCtrl.render()" style="font-size:.74rem;color:var(--acc);font-weight:600">Semua</button>`
+    el.appendChild(hdr)
+    buildSongList(enriched, el)
+    Toast.show(`${enriched.length} lagu tersimpan offline`,'success',1800)
   },
   async renderPlaylists(){
     const pls=await PlStore.getAll(), con=$('pl-list')
@@ -1313,6 +1652,17 @@ if('serviceWorker' in navigator){
 }
 
 /* ═══════════════════════════════════════════════
+   ONLINE / OFFLINE DETECTION
+   ═══════════════════════════════════════════════ */
+function updateOnlineStatus(){
+  const pill = $('offline-pill')
+  if(!pill) return
+  pill.classList.toggle('hidden', navigator.onLine)
+}
+window.addEventListener('online',  ()=>{ updateOnlineStatus(); Toast.show('🌐 Kembali online','success',2000) })
+window.addEventListener('offline', ()=>{ updateOnlineStatus(); Toast.show('📶 Mode offline — data tersimpan tetap bisa diputar','warning',3500) })
+
+/* ═══════════════════════════════════════════════
    BOOT
    ═══════════════════════════════════════════════ */
 document.addEventListener('DOMContentLoaded', async ()=>{
@@ -1329,6 +1679,7 @@ document.addEventListener('DOMContentLoaded', async ()=>{
   DetailSheet.init()
   HomeCtrl.init()
   document.getElementById('pg-home')?.classList.add('active')
+  updateOnlineStatus()
 
   // Preload idle
   ric(()=>{ fetch('/api/trending').catch(()=>{}) })
